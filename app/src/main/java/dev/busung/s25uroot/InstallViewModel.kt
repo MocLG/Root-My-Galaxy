@@ -195,7 +195,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 appendLog(app.getString(R.string.log_download_verified))
 
                 setPhase(InstallPhase.Exploiting, app.getString(R.string.status_exploit_running))
-                executeExploit(payloads.exploit)
+                executeExploit(profile, payloads.exploit)
 
                 setPhase(InstallPhase.LoadingKernelSu, app.getString(R.string.status_ksu_loading))
                 installKernelSu(payloads)
@@ -213,8 +213,11 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private suspend fun executeExploit(payload: File) {
+    private suspend fun executeExploit(profile: TargetProfile, payload: File) {
         val shizuku = shizukuEnabled()
+        // Fresh-P0 profiles consume their slide oracle in a single session, so
+        // the payload's compiled per-target attempts and timeouts must win.
+        val freshP0 = profile.requiresFreshP0Session
         val logFile = if (shizuku) File(SHIZUKU_LOG_PATH) else File(app.filesDir, "exploit.log")
         if (shizuku) {
             ShizukuController.exec(arrayOf("rm", "-f", SHIZUKU_LOG_PATH)).waitFor()
@@ -231,7 +234,12 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             val stagedPayload = shizukuStage(payload, SHIZUKU_PAYLOAD_PATH, "755")
             ShizukuController.exec(
                 arrayOf("/system/bin/sh", "-c", "true"),
-                shizukuEnvironment(bootToken, stagedPayload.absolutePath, helper.absolutePath),
+                shizukuEnvironment(
+                    bootToken,
+                    stagedPayload.absolutePath,
+                    helper.absolutePath,
+                    freshP0,
+                ),
             )
         } else {
             val processBuilder = ProcessBuilder(
@@ -242,10 +250,12 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 logFile.absolutePath,
             ).redirectErrorStream(true)
             processBuilder.environment().apply {
-                put("EXPLOIT_ATTEMPTS", EXPLOIT_ATTEMPTS)
-                put("P0_ATTEMPT_TIMEOUT_SEC", P0_ATTEMPT_TIMEOUT_SEC)
-                put("EXPLOIT_ATTEMPT_TIMEOUT_SEC", EXPLOIT_ATTEMPT_TIMEOUT_SEC)
-                cachedP0Offset(bootToken)?.let { put(P0_OFFSET_ENV, it) }
+                if (!freshP0) {
+                    put("EXPLOIT_ATTEMPTS", EXPLOIT_ATTEMPTS)
+                    put("P0_ATTEMPT_TIMEOUT_SEC", P0_ATTEMPT_TIMEOUT_SEC)
+                    put("EXPLOIT_ATTEMPT_TIMEOUT_SEC", EXPLOIT_ATTEMPT_TIMEOUT_SEC)
+                    cachedP0Offset(bootToken)?.let { put(P0_OFFSET_ENV, it) }
+                }
             }
             processBuilder.start()
         }
@@ -259,6 +269,10 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             { drainProcessOutput(process, captured); logFile.readTextIfPresent() }
         }
 
+        val stallMillis =
+            if (freshP0) FRESH_P0_EXPLOIT_STALL_MILLIS else EXPLOIT_STALL_MILLIS
+        val totalMillis =
+            if (freshP0) FRESH_P0_EXPLOIT_TOTAL_MILLIS else EXPLOIT_TOTAL_MILLIS
         try {
             val startedAt = SystemClock.elapsedRealtime()
             var lastProgressAt = startedAt
@@ -266,16 +280,16 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             while (process.isAlive) {
                 val rawLog = readLog()
                 if (rawLog != lastRawLog) {
-                    cacheP0Offset(bootToken, rawLog)
+                    if (!freshP0) cacheP0Offset(bootToken, rawLog)
                     publishExploitLog(logPrefix, rawLog)
                     lastRawLog = rawLog
                     lastProgressAt = SystemClock.elapsedRealtime()
                 }
                 val now = SystemClock.elapsedRealtime()
-                require(now - lastProgressAt < EXPLOIT_STALL_MILLIS) {
+                require(now - lastProgressAt < stallMillis) {
                     app.getString(R.string.error_exploit_stalled)
                 }
-                require(now - startedAt < EXPLOIT_TOTAL_MILLIS) {
+                require(now - startedAt < totalMillis) {
                     app.getString(R.string.error_exploit_timeout)
                 }
                 delay(if (shizuku) SHIZUKU_LOG_POLL_INTERVAL else LOG_POLL_INTERVAL)
@@ -283,7 +297,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
             val exitCode = process.waitFor()
             val rawLog = readLog()
-            cacheP0Offset(bootToken, rawLog)
+            if (!freshP0) cacheP0Offset(bootToken, rawLog)
             publishExploitLog(logPrefix, rawLog)
             // Both transports drain into `captured` during the poll loop, so
             // this never blocks on a child still holding the pipe open.
@@ -438,13 +452,18 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         bootToken: String?,
         payloadPath: String,
         helperPath: String,
+        freshP0: Boolean,
     ): Array<String> = buildList {
-        add("EXPLOIT_ATTEMPTS=$EXPLOIT_ATTEMPTS")
-        add("P0_ATTEMPT_TIMEOUT_SEC=$P0_ATTEMPT_TIMEOUT_SEC")
-        add("EXPLOIT_ATTEMPT_TIMEOUT_SEC=$EXPLOIT_ATTEMPT_TIMEOUT_SEC")
+        if (!freshP0) {
+            add("EXPLOIT_ATTEMPTS=$EXPLOIT_ATTEMPTS")
+            add("P0_ATTEMPT_TIMEOUT_SEC=$P0_ATTEMPT_TIMEOUT_SEC")
+            add("EXPLOIT_ATTEMPT_TIMEOUT_SEC=$EXPLOIT_ATTEMPT_TIMEOUT_SEC")
+        }
         add("CVE43499_ROOT_HELPER=$helperPath")
         add("LD_PRELOAD=$payloadPath")
-        cachedP0Offset(bootToken)?.let { add("$P0_OFFSET_ENV=$it") }
+        if (!freshP0) {
+            cachedP0Offset(bootToken)?.let { add("$P0_OFFSET_ENV=$it") }
+        }
     }.toTypedArray()
 
     /**
@@ -549,6 +568,8 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         private const val EXPLOIT_ATTEMPT_TIMEOUT_SEC = "120"
         private const val EXPLOIT_STALL_MILLIS = 90_000L
         private const val EXPLOIT_TOTAL_MILLIS = 900_000L
+        private const val FRESH_P0_EXPLOIT_STALL_MILLIS = 300_000L
+        private const val FRESH_P0_EXPLOIT_TOTAL_MILLIS = 2_700_000L
         private const val HELPER_TIMEOUT_MILLIS = 120_000L
         private const val INSTALL_RECEIPT = "install_receipt"
         private const val RECEIPT_BOOT_TOKEN = "kernel_boot_id"
